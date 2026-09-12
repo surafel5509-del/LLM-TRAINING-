@@ -1,7 +1,7 @@
 from pathlib import Path
 from datetime import datetime
 from multiprocessing import Process
-import json, shutil, time
+import json, shutil, time, logging
 import psutil, torch
 from fastapi import FastAPI, Depends, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,8 +13,9 @@ from .db import get_db, SessionLocal
 from .models import Project, Dataset, Model, TrainingRun, Metric, Checkpoint, ModelVersion
 from .ml import train_run, load_tabular, MLP
 
-app=FastAPI(title='Real ML Training Platform',version='0.2.0')
-app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in settings.cors_origins.split(',')],allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
+logger=logging.getLogger('forgeml')
+app=FastAPI(title='Real ML Training Platform',version='0.3.0')
+app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in settings.cors_origins.split(',') if x.strip()],allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
 processes={}
 class ProjectIn(BaseModel): name:str=Field(min_length=1,max_length=200)
 class ModelIn(BaseModel): project_id:str; name:str; task:str='classification'; input_size:int|None=None; output_size:int|None=None; hidden_layers:list[int]=[64,32]; activation:str='relu'; dropout:float=0.0
@@ -73,7 +74,8 @@ def runs(db:Session=Depends(get_db)): return [{'id':r.id,'status':r.status,'erro
 def _worker(run_id):
     db=SessionLocal()
     try: train_run(db,run_id)
-    except Exception: pass
+    except Exception:
+        logger.exception('training worker failed run_id=%s',run_id)
     finally: db.close()
 @app.post('/api/training/runs/{run_id}/start')
 def start_run(run_id:str,db:Session=Depends(get_db)):
