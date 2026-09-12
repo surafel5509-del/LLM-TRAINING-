@@ -16,9 +16,11 @@ from .core import settings, CPU_COUNT
 class MLP(nn.Module):
     def __init__(self,input_size,output_size,hidden,activation='relu',dropout=0.0):
         super().__init__(); acts={'relu':nn.ReLU,'tanh':nn.Tanh,'gelu':nn.GELU}; layers=[]; prev=input_size
+        if activation not in acts: raise ValueError(f'Unsupported activation: {activation}')
+        if not hidden: raise ValueError('At least one hidden layer is required')
         for h in hidden:
             if h<1: raise ValueError('Hidden layer sizes must be positive')
-            layers += [nn.Linear(prev,h),acts.get(activation,nn.ReLU)()]
+            layers += [nn.Linear(prev,h),acts[activation]()]
             if dropout: layers.append(nn.Dropout(dropout))
             prev=h
         layers.append(nn.Linear(prev,output_size)); self.net=nn.Sequential(*layers)
@@ -59,13 +61,23 @@ def train_run(db:Session,run_id:str):
     run=db.get(TrainingRun,run_id); run.status='PREPARING'; db.commit()
     try:
         cfg=run.config; set_seed(int(cfg['seed'])); workers=max(0,min(CPU_COUNT,int(cfg['cpu_workers']))); threads=max(1,min(CPU_COUNT,int(cfg['threads']))); torch.set_num_threads(threads)
-        dataset=db.get(Dataset,run.dataset_id); X,y=load_tabular(Path(dataset.path),cfg['target']); (splits,scaler,columns)=prepare_splits(X,y,cfg['task'],cfg['seed'],(cfg['train_ratio'],cfg['val_ratio'],cfg['test_ratio'])); (Xtr,ytr),(Xva,yva),(Xte,yte)=splits
-        targets,out,labels=make_targets(ytr,yva,yte,cfg['task']); model=MLP(Xtr.shape[1],out,cfg['hidden_layers'],cfg['activation'],cfg['dropout']); loss_fn=nn.MSELoss() if cfg['task']=='regression' else nn.CrossEntropyLoss(); opt_cls={'adam':torch.optim.Adam,'sgd':torch.optim.SGD}[cfg['optimizer']]; opt=opt_cls(model.parameters(),lr=cfg['learning_rate'],weight_decay=cfg['weight_decay'])
+        dataset=db.get(Dataset,run.dataset_id)
+        if not dataset: raise ValueError('Dataset not found')
+        X,y=load_tabular(Path(dataset.path),cfg['target']); (splits,scaler,columns)=prepare_splits(X,y,cfg['task'],cfg['seed'],(cfg['train_ratio'],cfg['val_ratio'],cfg['test_ratio'])); (Xtr,ytr),(Xva,yva),(Xte,yte)=splits
+        targets,out,labels=make_targets(ytr,yva,yte,cfg['task']); model=MLP(Xtr.shape[1],out,cfg['hidden_layers'],cfg['activation'],cfg['dropout']); loss_fn=nn.MSELoss() if cfg['task']=='regression' else nn.CrossEntropyLoss(); opt_cls={'adam':torch.optim.Adam,'sgd':torch.optim.SGD}.get(cfg['optimizer']);
+        if opt_cls is None: raise ValueError(f'Unsupported optimizer: {cfg["optimizer"]}')
+        opt=opt_cls(model.parameters(),lr=cfg['learning_rate'],weight_decay=cfg['weight_decay'])
         train_loader=DataLoader(TensorDataset(torch.tensor(Xtr),targets[0]),batch_size=cfg['batch_size'],shuffle=True,num_workers=workers); val_loader=DataLoader(TensorDataset(torch.tensor(Xva),targets[1]),batch_size=cfg['batch_size'],shuffle=False,num_workers=workers); test_loader=DataLoader(TensorDataset(torch.tensor(Xte),targets[2]),batch_size=cfg['batch_size'],shuffle=False,num_workers=workers)
-        run.status='RUNNING'; run.started_at=datetime.utcnow(); db.commit(); run_dir=settings.storage_root/'runs'/run_id; run_dir.mkdir(parents=True,exist_ok=True); best=float('inf')
-        for epoch in range(1,cfg['epochs']+1):
+        run_dir=settings.storage_root/'runs'/run_id; run_dir.mkdir(parents=True,exist_ok=True)
+        latest=db.query(Checkpoint).filter(Checkpoint.run_id==run_id).order_by(Checkpoint.epoch.desc()).first(); start_epoch=1; best=float('inf')
+        if latest and Path(latest.path).exists():
+            state=torch.load(latest.path,map_location='cpu',weights_only=True); model.load_state_dict(state['model_state']); opt.load_state_dict(state['optimizer_state']); start_epoch=int(state['epoch'])+1; best=min(float(m.loss) for m in db.query(Metric).filter(Metric.run_id==run_id,Metric.split=='validation').all()) if db.query(Metric).filter(Metric.run_id==run_id,Metric.split=='validation').count() else float('inf')
+        run.status='RUNNING'; run.started_at=run.started_at or datetime.utcnow(); db.commit()
+        for epoch in range(start_epoch,cfg['epochs']+1):
             if (run_dir/'cancel').exists(): run.status='CANCELLED'; run.finished_at=datetime.utcnow(); db.commit(); return
-            while (run_dir/'pause').exists(): run.status='PAUSED'; db.commit(); time.sleep(.5)
+            while (run_dir/'pause').exists():
+                run.status='PAUSED'; db.commit(); time.sleep(.5)
+                if (run_dir/'cancel').exists(): run.status='CANCELLED'; run.finished_at=datetime.utcnow(); db.commit(); return
             run.status='RUNNING'; db.commit(); model.train(); t0=time.time(); total=n=0
             for xb,yb in train_loader:
                 opt.zero_grad(set_to_none=True); outp=model(xb); loss=loss_fn(outp,yb); loss.backward(); opt.step(); total+=loss.item()*len(yb); n+=len(yb)
@@ -74,4 +86,4 @@ def train_run(db:Session,run_id:str):
             ck=run_dir/f'checkpoint-{epoch}.pt'; torch.save({'model_state':model.state_dict(),'optimizer_state':opt.state_dict(),'epoch':epoch,'config':cfg,'seed':cfg['seed'],'input_size':Xtr.shape[1],'output_size':out,'columns':columns,'labels':labels},ck); db.add(Checkpoint(run_id=run_id,epoch=epoch,path=str(ck),is_best=vl<best)); best=min(best,vl); db.commit()
         test_loss,test_metrics=evaluate(model,test_loader,loss_fn,cfg['task']); final=run_dir/'final.pt'; torch.save({'model_state':model.state_dict(),'config':cfg,'input_size':Xtr.shape[1],'output_size':out,'columns':columns,'labels':labels,'scaler_mean':scaler.mean_.tolist(),'scaler_scale':scaler.scale_.tolist()},final); (run_dir/'test_metrics.json').write_text(json.dumps({'loss':test_loss,**test_metrics},indent=2)); version=(db.query(ModelVersion).filter(ModelVersion.model_id==run.model_id).count()+1); db.add(ModelVersion(model_id=run.model_id,run_id=run_id,version=version,checkpoint_path=str(final),metrics={'test_loss':test_loss,**test_metrics})); run.status='COMPLETED'; run.finished_at=datetime.utcnow(); db.commit()
     except Exception as exc:
-        run.status='FAILED'; run.error=f'{type(exc).__name__}: {exc}'; run.finished_at=datetime.utcnow(); db.commit(); raise
+        db.rollback(); run=db.get(TrainingRun,run_id); run.status='FAILED'; run.error=f'{type(exc).__name__}: {exc}'; run.finished_at=datetime.utcnow(); db.commit(); raise
