@@ -1,10 +1,13 @@
-.PHONY: install dev test train-test docker
+.PHONY: install dev migrate test train-test docker
 install:
 	python -m pip install -r backend/requirements.txt
 	cd frontend && npm install
 
 dev:
 	uvicorn app.main:app --app-dir backend --reload
+
+migrate:
+	alembic -c backend/alembic.ini upgrade head
 
 test:
 	PYTHONPATH=backend pytest -q backend/tests
