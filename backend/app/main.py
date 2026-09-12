@@ -9,11 +9,10 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, Field
 from .core import settings, CPU_COUNT
-from .db import Base, engine, get_db, SessionLocal
-from .models import Project, Dataset, Model, TrainingRun, Metric, Checkpoint, Evaluation, ModelVersion
+from .db import get_db, SessionLocal
+from .models import Project, Dataset, Model, TrainingRun, Metric, Checkpoint, ModelVersion
 from .ml import train_run, load_tabular, MLP
 
-Base.metadata.create_all(engine)
 app=FastAPI(title='Real ML Training Platform',version='0.2.0')
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in settings.cors_origins.split(',')],allow_credentials=True,allow_methods=['*'],allow_headers=['*'])
 processes={}
@@ -21,7 +20,6 @@ class ProjectIn(BaseModel): name:str=Field(min_length=1,max_length=200)
 class ModelIn(BaseModel): project_id:str; name:str; task:str='classification'; input_size:int|None=None; output_size:int|None=None; hidden_layers:list[int]=[64,32]; activation:str='relu'; dropout:float=0.0
 class TrainIn(BaseModel): project_id:str; dataset_id:str; model_id:str; target:str; task:str; hidden_layers:list[int]=[64,32]; activation:str='relu'; dropout:float=0.0; optimizer:str='adam'; learning_rate:float=1e-3; weight_decay:float=0.0; batch_size:int=32; epochs:int=10; train_ratio:float=0.7; val_ratio:float=0.15; test_ratio:float=0.15; seed:int=42; cpu_workers:int=1; threads:int=1
 class InferIn(BaseModel): features:list[float]
-
 def safe_name(name): return Path(name).name.replace(' ','_')
 @app.get('/api/health')
 def health(): return {'status':'ok','device':'cpu','cpu_cores':CPU_COUNT,'torch_version':torch.__version__}
@@ -63,8 +61,7 @@ def create_model(payload:ModelIn,db:Session=Depends(get_db)):
 def models(project_id:str|None=None,db:Session=Depends(get_db)):
     q=db.query(Model); q=q.filter(Model.project_id==project_id) if project_id else q; return [{'id':m.id,'name':m.name,'task':m.task,'architecture':m.architecture} for m in q.all()]
 @app.get('/api/models/{model_id}/versions')
-def model_versions(model_id:str,db:Session=Depends(get_db)):
-    return [{'id':v.id,'version':v.version,'run_id':v.run_id,'checkpoint_path':v.checkpoint_path,'metrics':v.metrics,'created_at':v.created_at} for v in db.query(ModelVersion).filter(ModelVersion.model_id==model_id).order_by(ModelVersion.version).all()]
+def model_versions(model_id:str,db:Session=Depends(get_db)): return [{'id':v.id,'version':v.version,'run_id':v.run_id,'checkpoint_path':v.checkpoint_path,'metrics':v.metrics,'created_at':v.created_at} for v in db.query(ModelVersion).filter(ModelVersion.model_id==model_id).order_by(ModelVersion.version).all()]
 @app.post('/api/training/runs')
 def create_run(payload:TrainIn,db:Session=Depends(get_db)):
     if payload.learning_rate<=0 or payload.batch_size<1 or payload.epochs<1: raise HTTPException(400,'Invalid training configuration')
@@ -111,9 +108,8 @@ def infer(model_id:str,payload:InferIn,db:Session=Depends(get_db)):
     if not v or not Path(v.checkpoint_path).exists(): raise HTTPException(404,'No trained model version exists')
     ck=torch.load(v.checkpoint_path,map_location='cpu',weights_only=True); cfg=ck['config']; model=MLP(ck['input_size'],ck['output_size'],cfg['hidden_layers'],cfg['activation'],cfg['dropout']); model.load_state_dict(ck['model_state']); model.eval()
     if len(payload.features)!=ck['input_size']: raise HTTPException(400,f'Expected {ck["input_size"]} features')
-    x=torch.tensor(payload.features,dtype=torch.float32); scale=torch.tensor(ck['scaler_scale'],dtype=torch.float32); mean=torch.tensor(ck['scaler_mean'],dtype=torch.float32); x=(x-mean)/scale
-    t=time.perf_counter(); out=model(x.view(1,-1)); elapsed=(time.perf_counter()-t)*1000
-    if cfg['task']=='regression': pred=float(out.item()); result={'prediction':pred}
+    x=torch.tensor(payload.features,dtype=torch.float32); scale=torch.tensor(ck['scaler_scale'],dtype=torch.float32); mean=torch.tensor(ck['scaler_mean'],dtype=torch.float32); x=(x-mean)/scale; t=time.perf_counter(); out=model(x.view(1,-1)); elapsed=(time.perf_counter()-t)*1000
+    if cfg['task']=='regression': result={'prediction':float(out.item())}
     else:
         probs=torch.softmax(out,dim=1)[0]; idx=int(torch.argmax(probs)); result={'prediction':ck['labels'][idx] if ck['labels'] else idx,'probabilities':probs.tolist(),'confidence':float(probs[idx])}
     result['inference_ms']=elapsed; result['model_version']=v.version; return result
